@@ -573,7 +573,17 @@ with tabs[1]:
 # Structure tab (py3Dmol)
 with tabs[4]:
     st.subheader("🧬 Structure Visualization (upload PDB)")
-    st.markdown("Generate structures using AlphaFold/ColabFold externally, then upload the PDB to visualize it here.")
+    st.markdown(
+        "You can generate a predicted 3D structure for your peptide using "
+        "**[ColabFold]("
+        "https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/AlphaFold2_mmseqs2_advanced.ipynb"
+        ")**:\n"
+        "1. Open the link above in Google Colab.\n"
+        "2. Paste your peptide sequence in FASTA format.\n"
+        "3. Run the notebook (needs a GPU runtime).\n"
+        "4. Download the predicted PDB file.\n"
+        "5. Upload the PDB file below to visualize it here."
+    )
     uploaded_pdb = st.file_uploader("Upload PDB file", type=["pdb"])
     def _show_pdb_in_py3dmol(pdb_text: str, width: int = 700, height: int = 450):
         if not HAS_PY3DMOL:
