@@ -241,19 +241,10 @@ with st.sidebar:
     if st.button("Use sample"):
         st.session_state["user_seq"] = sample
     st.divider()
-    st.markdown("**About This Tool**")
-    st.markdown(
-        "PepTastePredictor is a **machine learning-based predictive model** trained on peptide "
-        "taste classification data. It uses a Random Forest classifier to predict peptide taste classes "
-        "based on computed biochemical properties."
-    )
-    st.markdown("**Key Features:**")
-    st.markdown(
-        "- **Machine Learning Model**: Trained on labeled peptide sequences using scikit-learn\n"
-        "- **Property Computation**: Uses Biopython (Bio.SeqUtils.ProtParam) to compute 11 key biochemical features\n"
-        "- **Structure Generation**: Generates 3D PDB files using PeptideBuilder for visualization\n"
-        "- **Confidence Scores**: Provides probability distributions for predicted taste classes"
-    )
+    st.markdown("Notes")
+    st.markdown("- Ensure AIML.xlsx (dataset) is in the app root to enable training.")
+    st.markdown("- Upload PDBs from AlphaFold/ColabFold to visualize structures.")
+    st.markdown("- PeptideBuilder is optional; if missing a CA-only PDB will be generated.")
 
 # Load dataset (cached)
 @st.cache_data
@@ -421,16 +412,21 @@ with tabs[0]:
                     if feats_df.empty or feats_df.isna().all(axis=None):
                         st.warning("Feature computation failed or returned invalid values.")
                     else:
-                        if model is None:
-                            st.warning("Model not available to generate prediction.")
-                            predicted = "Unknown"
+                        # Rule override for salty
+                        if msg in OVERRIDE_SALTY:
+                            predicted = "Salty"
                             probs = None
                         else:
-                            predicted = model.predict(feats_df)[0]
-                            try:
-                                probs = model.predict_proba(feats_df)[0]
-                            except Exception:
+                            if model is None:
+                                st.warning("Model not available to generate prediction.")
+                                predicted = "Unknown"
                                 probs = None
+                            else:
+                                predicted = model.predict(feats_df)[0]
+                                try:
+                                    probs = model.predict_proba(feats_df)[0]
+                                except Exception:
+                                    probs = None
 
                         st.markdown(f"<div class='card'><h3 style='margin:0'>Predicted Taste: <span style='color:#66b8ff'>{predicted}</span></h3></div>", unsafe_allow_html=True)
 
@@ -539,26 +535,41 @@ with tabs[1]:
                         try:
                             preds = model.predict(feats_up)
                             df_up.loc[df_up["_valid"], "Predicted_Taste"] = preds
-                            st.write("Batch predictions (invalid rows flagged):")
-                            st.dataframe(df_up.drop(columns=["_peptide_norm"]))
-                            st.download_button("Download predictions CSV", data=df_up.drop(columns=["_peptide_norm"]).to_csv(index=False).encode(), file_name="predictions.csv", mime="text/csv")
+                            
+                            # Add properties for each valid peptide
+                            valid_seqs = df_up.loc[df_up["_valid"], "_peptide_norm"].tolist()
+                            properties_list = []
+                            for seq in valid_seqs:
+                                try:
+                                    props = compute_peptide_properties(seq)
+                                    properties_list.append(props)
+                                except Exception:
+                                    properties_list.append({})
+                            
+                            # Create properties dataframe
+                            props_df = pd.DataFrame(properties_list)
+                            
+                            # Add properties columns to the main dataframe
+                            df_up.loc[df_up["_valid"], props_df.columns] = props_df.values
+                            
+                            # Prepare download dataframe (remove internal columns)
+                            download_df = df_up.drop(columns=["_peptide_norm", "_valid"])
+                            
+                            st.write("Batch predictions with properties:")
+                            st.dataframe(download_df)
+                            st.download_button(
+                                "📥 Download CSV with Predictions & Properties", 
+                                data=download_df.to_csv(index=False).encode(), 
+                                file_name="predictions_with_properties.csv", 
+                                mime="text/csv"
+                            )
                         except Exception as e:
                             st.error(f"Batch prediction failed: {e}")
 
 # Structure tab (py3Dmol)
 with tabs[4]:
     st.subheader("🧬 Structure Visualization (upload PDB)")
-    st.markdown(
-        "You can generate a predicted 3D structure for your peptide using "
-        "**[ColabFold]("
-        "https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/AlphaFold2_mmseqs2_advanced.ipynb"
-        ")**:\n"
-        "1. Open the link above in Google Colab.\n"
-        "2. Paste your peptide sequence in FASTA format.\n"
-        "3. Run the notebook (needs a GPU runtime).\n"
-        "4. Download the predicted PDB file.\n"
-        "5. Upload the PDB file below to visualize it here."
-    )
+    st.markdown("Generate structures using AlphaFold/ColabFold externally, then upload the PDB to visualize it here.")
     uploaded_pdb = st.file_uploader("Upload PDB file", type=["pdb"])
     def _show_pdb_in_py3dmol(pdb_text: str, width: int = 700, height: int = 450):
         if not HAS_PY3DMOL:
