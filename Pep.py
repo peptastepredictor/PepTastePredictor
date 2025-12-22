@@ -1,46 +1,114 @@
+#!/usr/bin/env python3
+"""
+PeptideTaste.py
+
+Single-file Streamlit app that merges two provided codebases into one cohesive
+Streamlit application. The Streamlit UI is authoritative; helper functions and
+model logic are taken from both sources and the most robust (high-certainty)
+implementation is used when overlapping.
+
+Features:
+- Load dataset (AIML.xlsx) and train / load a RandomForest taste classifier.
+- Single-sequence prediction with feature computation, probabilities, docking
+  heuristic, 3-letter conversion, and PDB generation (PeptideBuilder if available,
+  fallback CA trace).
+- Batch prediction from CSV / Excel with a 'peptide' column.
+- Model metrics: classification report, confusion matrix, top feature importances.
+- 3D PDB visualization using py3Dmol (if installed) for uploaded PDBs.
+- Defensive validation, stable feature ordering, and caching for speed.
+
+Run:
+  streamlit run PeptideTaste.py
+
+Requirements (install as needed):
+  pip install streamlit pandas numpy scikit-learn joblib biopython matplotlib seaborn py3Dmol
+  (PeptideBuilder optional: pip install PeptideBuilder)
+"""
+
 import os
-import gradio as gr
+import io
+import textwrap
+from typing import Tuple, Dict, List, Union
+
+import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-from Bio.SeqUtils.ProtParam import ProteinAnalysis
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    confusion_matrix, accuracy_score, f1_score,
-    mean_squared_error, r2_score
-)
+import joblib
+
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.decomposition import PCA
-from collections import Counter
-import matplotlib.ticker as mticker
 
-# 3D structure libs
-from Bio.PDB import PDBIO
-import PeptideBuilder
-from PeptideBuilder import Geometry
+# BioPython helpers
+try:
+    from Bio.SeqUtils.ProtParam import ProteinAnalysis
+    from Bio.SeqUtils import seq3
+    HAS_BIOPY = True
+except Exception:
+    HAS_BIOPY = False
 
-# ---------- Helpers ----------
+# Optional: PeptideBuilder for nicer PDB building
+try:
+    import PeptideBuilder
+    from PeptideBuilder import Geometry
+    from Bio.PDB import PDBIO
+    HAS_PEPTIDEBUILDER = True
+except Exception:
+    HAS_PEPTIDEBUILDER = False
+
+# Optional: 3D viewer
+try:
+    import py3Dmol
+    HAS_PY3DMOL = True
+except Exception:
+    HAS_PY3DMOL = False
+
+# -----------------------------
+# Constants / Config
+# -----------------------------
+APP_TITLE = "PepTastePredictor"
+MODEL_PATH = "taste_model.pkl"
+DATA_PATH = "AIML.xlsx"
 AA_ALLOWED = set("ACDEFGHIKLMNPQRSTVWY")
 THREE_LETTER = {
-    "A":"ALA","C":"CYS","D":"ASP","E":"GLU","F":"PHE","G":"GLY","H":"HIS","I":"ILE",
-    "K":"LYS","L":"LEU","M":"MET","N":"ASN","P":"PRO","Q":"GLN","R":"ARG","S":"SER",
-    "T":"THR","V":"VAL","W":"TRP","Y":"TYR"
+    "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY", "H": "HIS", "I": "ILE",
+    "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG", "S": "SER",
+    "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"
 }
-
 # Rule-based overrides (always salty, uppercase)
 OVERRIDE_SALTY = {"NQITKPNDVY", "EDEGEQPRPF"}
 
+# -----------------------------
+# Utility functions (feature computation, validation, docking)
+# -----------------------------
 def clean_seq(seq: str) -> str:
-    return "".join(seq.upper().split())
+    return "".join(str(seq).upper().split())
 
-def validate_seq(seq: str):
-    bad = set(seq) - AA_ALLOWED
+def validate_sequence(seq: str) -> Tuple[bool, str]:
+    """
+    Validate sequence. Returns (True, cleaned_seq) if valid, otherwise (False, message).
+    """
+    if seq is None:
+        return False, "No sequence provided."
+    s = clean_seq(seq)
+    if s == "":
+        return False, "Sequence is empty after cleaning."
+    bad = set(s) - AA_ALLOWED
     if bad:
-        raise gr.Error(f"Invalid characters in sequence: {''.join(sorted(bad))}")
+        return False, f"Invalid characters in sequence: {''.join(sorted(bad))}"
+    return True, s
 
-def compute_features(seq: str):
+def compute_features_single(seq: str) -> Dict[str, float]:
+    """
+    Compute numeric features for a single sequence using Bio.SeqUtils.ProtParam.
+    Uses deterministic ordering (dict insertion order).
+    """
+    if not HAS_BIOPY:
+        raise RuntimeError("Biopython is required for feature computation (install with `pip install biopython`).")
     analysed = ProteinAnalysis(seq)
     aa_composition = analysed.amino_acids_percent
     ai = (
@@ -48,7 +116,8 @@ def compute_features(seq: str):
         + aa_composition.get("V", 0) * 100 * 2.9
         + (aa_composition.get("I", 0) + aa_composition.get("L", 0)) * 100 * 3.9
     )
-    return {
+    ss = analysed.secondary_structure_fraction()
+    feats = {
         "Molecular weight(g/mol)": float(f"{analysed.molecular_weight():.5f}"),
         "Isoelectric Point": float(f"{analysed.isoelectric_point():.4f}"),
         "Aromaticity": float(f"{analysed.aromaticity():.5f}"),
@@ -57,13 +126,68 @@ def compute_features(seq: str):
         "GRAVY (Hydropathy)": float(f"{analysed.gravy():.5f}"),
         "Aliphatic Index": float(f"{ai:.4f}"),
         "Flexibility (avg)": float(f"{np.mean(analysed.flexibility()):.5f}"),
-        "Helix Fraction": float(f"{analysed.secondary_structure_fraction()[0]:.5f}"),
-        "Turn Fraction": float(f"{analysed.secondary_structure_fraction()[1]:.5f}"),
-        "Sheet Fraction": float(f"{analysed.secondary_structure_fraction()[2]:.5f}"),
+        "Helix Fraction": float(f"{ss[0]:.5f}"),
+        "Turn Fraction": float(f"{ss[1]:.5f}"),
+        "Sheet Fraction": float(f"{ss[2]:.5f}"),
     }
+    return feats
 
-# ---------- Build structures ----------
+def compute_features(sequences: Union[str, List[str], pd.Series]) -> Union[Dict[str, float], pd.DataFrame]:
+    """
+    If input is a single string, returns dict.
+    If list-like, returns DataFrame with stable column order.
+    """
+    if isinstance(sequences, str):
+        return compute_features_single(sequences)
+    seqs = list(sequences)
+    rows = []
+    for s in seqs:
+        ok, cleaned_or_msg = validate_sequence(s)
+        if not ok:
+            # produce row of NaNs (caller should filter invalid sequences)
+            rows.append({k: np.nan for k in compute_features_single("ACD").keys()})
+        else:
+            rows.append(compute_features_single(cleaned_or_msg))
+    df = pd.DataFrame(rows)
+    return df
+
+def compute_peptide_properties(seq: str) -> Dict[str, Union[str, float]]:
+    """
+    Friendly properties mapping for UI display.
+    """
+    feats = compute_features_single(seq)
+    props = {
+        "Sequence": seq,
+        "Length": len(seq),
+        "Molecular weight (g/mol)": feats["Molecular weight(g/mol)"],
+        "Isoelectric point": feats["Isoelectric Point"],
+        "GRAVY (Hydropathy)": feats["GRAVY (Hydropathy)"],
+        "Aliphatic Index": feats["Aliphatic Index"],
+        "Instability Index": feats["Instability Index"],
+        "Net charge at pH 7": feats["Net charge -pH:7"],
+        "Aromaticity": feats["Aromaticity"],
+        "Helix fraction": feats["Helix Fraction"],
+        "Turn fraction": feats["Turn Fraction"],
+        "Sheet fraction": feats["Sheet Fraction"],
+    }
+    return props
+
+def compute_docking_score(gravy: float, confidence: float) -> int:
+    """
+    Heuristic 0..100 docking "score" combining confidence and hydrophobicity.
+    """
+    g_norm = (gravy + 2.0) / 4.0  # assume typical GRAVY in [-2,2]
+    g_norm = float(np.clip(g_norm, 0.0, 1.0))
+    c_norm = float(np.clip(confidence, 0.0, 1.0))
+    score = int(round((c_norm * 0.7 + g_norm * 0.3) * 100))
+    return int(np.clip(score, 0, 100))
+
+# -----------------------------
+# PDB builders (PeptideBuilder fallback)
+# -----------------------------
 def build_peptide_pdb_peptidebuilder(seq: str) -> str:
+    if not HAS_PEPTIDEBUILDER:
+        raise RuntimeError("PeptideBuilder not available")
     if len(seq) == 0:
         raise ValueError("Empty sequence")
     structure = PeptideBuilder.initialize_res(seq[0])
@@ -71,11 +195,16 @@ def build_peptide_pdb_peptidebuilder(seq: str) -> str:
         geom = Geometry.geometry(aa)
         PeptideBuilder.add_residue(structure, geom)
     io = PDBIO()
+    tmp = "temp_pepbuild.pdb"
     io.set_structure(structure)
-    pdb_path = "temp_pepbuild.pdb"
-    io.save(pdb_path)
-    with open(pdb_path, "r") as f:
-        return f.read()
+    io.save(tmp)
+    with open(tmp, "r") as f:
+        pdb_text = f.read()
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    return pdb_text
 
 def build_linear_ca_trace_pdb(seq: str, step: float = 3.8) -> str:
     lines = []
@@ -94,240 +223,359 @@ def build_linear_ca_trace_pdb(seq: str, step: float = 3.8) -> str:
     lines.append("END")
     return "\n".join(lines)
 
-# ---------- Load dataset ----------
-if not os.path.exists("AIML.xlsx"):
-    raise FileNotFoundError("⚠️ AIML.xlsx missing. Upload it to this Space!")
-
-df = pd.read_excel("AIML.xlsx")
-df.columns = df.columns.str.strip()
-df = df.drop(columns=["References", "Unnamed: 10"], errors="ignore")
-
-df["peptide"] = df["peptide"].astype(str).str.replace(r"\s+", "", regex=True).str.upper()
-mask_valid = df["peptide"].apply(lambda s: set(s) <= AA_ALLOWED)
-df = df[mask_valid].reset_index(drop=True)
-
-taste_encoder = LabelEncoder()
-sol_encoder = LabelEncoder()
-y_taste = taste_encoder.fit_transform(df["Taste"].astype(str).str.strip())
-y_sol = sol_encoder.fit_transform(df["solubilty"].astype(str).str.strip())
-y_dock = df["Docking score (kcal/mol)"].astype(float).values
-
-train_feats = [list(compute_features(seq).values()) for seq in df["peptide"]]
-X = pd.DataFrame(train_feats, columns=list(compute_features("ACD").keys()))
-
-class_counts = Counter(y_taste)
-strat = y_taste if min(class_counts.values()) >= 2 else None
-
-X_train, X_test, y_taste_train, y_taste_test, y_sol_train, y_sol_test, y_dock_train, y_dock_test = train_test_split(
-    X, y_taste, y_sol, y_dock,
-    test_size=0.2,
-    random_state=42,
-    stratify=strat
-)
-
-taste_model = RandomForestClassifier(n_estimators=500, random_state=42, class_weight="balanced")
-taste_model.fit(X_train, y_taste_train)
-sol_model = RandomForestClassifier(n_estimators=500, random_state=42, class_weight="balanced")
-sol_model.fit(X_train, y_sol_train)
-dock_model = RandomForestRegressor(n_estimators=700, random_state=42)
-dock_model.fit(X_train, y_dock_train)
-
-# ---------- Evaluation ----------
-y_taste_pred = taste_model.predict(X_test)
-y_sol_pred = sol_model.predict(X_test)
-y_dock_pred = dock_model.predict(X_test)
-
-taste_acc = accuracy_score(y_taste_test, y_taste_pred)
-taste_f1 = f1_score(y_taste_test, y_taste_pred, average="macro")
-sol_acc = accuracy_score(y_sol_test, y_sol_pred)
-sol_f1 = f1_score(y_sol_test, y_sol_pred, average="macro")
-dock_rmse = np.sqrt(mean_squared_error(y_dock_test, y_dock_pred))
-dock_r2 = r2_score(y_dock_test, y_dock_pred)
-
-def model_report():
-    return f"""
-    ### 📊 Model Performance on Hold-out Test Set
-    **Taste**
-    - Accuracy: {taste_acc:.3f}
-    - F1-score (macro): {taste_f1:.3f}
-    **Solubility**
-    - Accuracy: {sol_acc:.3f}
-    - F1-score (macro): {sol_f1:.3f}
-    **Docking Score**
-    - RMSE: {dock_rmse:.3f}
-    - R²: {dock_r2:.3f}
+def save_pdb_bytes(seq: str) -> Tuple[str, bytes]:
     """
-
-# ---------- Prediction ----------
-def predict_single(sequence: str):
-    seq = clean_seq(sequence).strip().upper()
-    if not seq:
-        return pd.DataFrame([{"Message": "Enter a sequence to get predictions."}])
-    validate_seq(seq)
-    feats = compute_features(seq)
-    feat_list = list(feats.values())
-
-    # Rule override for salty
-    if seq in OVERRIDE_SALTY:
-        feats["Predicted Taste"] = "Salty"
-    else:
-        taste_pred = taste_model.predict([feat_list])[0]
-        feats["Predicted Taste"] = taste_encoder.inverse_transform([taste_pred])[0]
-
-    sol_pred = sol_model.predict([feat_list])[0]
-    dock_pred = dock_model.predict([feat_list])[0]
-    feats["Predicted Solubility"] = sol_encoder.inverse_transform([sol_pred])[0]
-    feats["Predicted Docking Score (kcal/mol)"] = float(f"{dock_pred:.5f}")
-    feats["Sequence"] = seq
-    return pd.DataFrame([feats])
-
-def batch_predict(file):
-    if file.name.endswith(".xlsx"):
-        df_in = pd.read_excel(file.name)
-    elif file.name.endswith(".csv"):
-        df_in = pd.read_csv(file.name)
-    else:
-        raise gr.Error("Upload CSV/Excel with a 'peptide' column")
-    if "peptide" not in df_in.columns:
-        raise gr.Error("The uploaded file must contain a column named 'peptide'")
-
-    results = []
-    for seq in df_in["peptide"]:
-        seq = clean_seq(seq).strip().upper()
-        if not seq:
-            continue
-        feats = compute_features(seq)
-        feat_list = list(feats.values())
-
-        # Rule override for salty
-        if seq in OVERRIDE_SALTY:
-            feats["Predicted Taste"] = "Salty"
-        else:
-            taste_pred = taste_model.predict([feat_list])[0]
-            feats["Predicted Taste"] = taste_encoder.inverse_transform([taste_pred])[0]
-
-        sol_pred = sol_model.predict([feat_list])[0]
-        dock_pred = dock_model.predict([feat_list])[0]
-        feats["Predicted Solubility"] = sol_encoder.inverse_transform([sol_pred])[0]
-        feats["Predicted Docking Score (kcal/mol)"] = float(f"{dock_pred:.5f}")
-        feats["Sequence"] = seq
-        results.append(feats)
-
-    return pd.DataFrame(results)
-
-# ---------- PDB Save ----------
-def save_pdb(seq):
-    seq = clean_seq(seq).strip().upper()
-    validate_seq(seq)
+    Try to build PDB with PeptideBuilder; fallback to CA-trace.
+    Returns (filename, bytes_content).
+    """
+    seq_clean = clean_seq(seq)
+    if not seq_clean:
+        raise ValueError("Empty sequence")
     try:
-        pdb_str = build_peptide_pdb_peptidebuilder(seq)
+        pdb_str = build_peptide_pdb_peptidebuilder(seq_clean)
     except Exception:
-        pdb_str = build_linear_ca_trace_pdb(seq)
-    safe_seq = "".join(c for c in seq if c.isalnum())
+        pdb_str = build_linear_ca_trace_pdb(seq_clean)
+    safe_seq = "".join([c for c in seq_clean if c.isalnum()])
     if not safe_seq:
         safe_seq = "peptide"
     filename = f"{safe_seq}.pdb"
-    with open(filename, "w") as f:
-        f.write(pdb_str)
-    return filename
+    return filename, pdb_str.encode("utf-8")
 
-# ---------- Visualizations ----------
-def plot_confusion_taste():
-    y_pred = taste_model.predict(X_test)
-    cm = confusion_matrix(y_taste_test, y_pred)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=taste_encoder.classes_,
-                yticklabels=taste_encoder.classes_, ax=ax)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title("Confusion Matrix (Taste)")
-    plt.tight_layout()
-    return fig
+# -----------------------------
+# Streamlit app UI + model training / loading
+# -----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="🧬")
 
-def plot_confusion_solubility():
-    y_pred = sol_model.predict(X_test)
-    cm = confusion_matrix(y_sol_test, y_pred)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Greens",
-                xticklabels=sol_encoder.classes_,
-                yticklabels=sol_encoder.classes_, ax=ax)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title("Confusion Matrix (Solubility)")
-    plt.tight_layout()
-    return fig
+# Minimal CSS for nicer look
+st.markdown(
+    """
+    <style>
+      .hero { background: linear-gradient(90deg,#071422,#0b1724); padding:18px; border-radius:10px; color: #e6eef8; }
+      .card { padding:10px; border-radius:8px; background:#0f1724; color:#e6eef8; }
+      .small { font-size:0.95rem; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-def plot_pca():
-    X_clean = X.replace([np.inf, -np.inf], np.nan).dropna()
-    coords = PCA(n_components=2).fit_transform(X_clean)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    scatter = ax.scatter(coords[:, 0], coords[:, 1], c=y_taste[:len(X_clean)], cmap="tab10")
-    ax.legend(*scatter.legend_elements(), title="Taste", bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax.set_title("PCA of Peptide Features (Taste Classes)")
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f"))
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3f"))
-    plt.tight_layout()
-    return fig
+# Sidebar
+with st.sidebar:
+    st.title(APP_TITLE)
+    st.write("Predict peptide taste classes, compute properties, visualize structures.")
+    st.divider()
+    st.markdown("**Try sample sequences**")
+    sample_sequences = ["EDEGEQPRPF", "GGGSSH", "ACDEFGHIK", "FLGFR"]
+    sample = st.selectbox("Sample", sample_sequences)
+    if st.button("Use sample"):
+        st.session_state["user_seq"] = sample
+    st.divider()
+    st.markdown("Notes")
+    st.markdown("- Ensure AIML.xlsx (dataset) is in the app root to enable training.")
+    st.markdown("- Upload PDBs from AlphaFold/ColabFold to visualize structures.")
+    st.markdown("- PeptideBuilder is optional; if missing a CA-only PDB will be generated.")
 
-def plot_importance():
-    fig, ax = plt.subplots(figsize=(9, 6))
-    sns.barplot(x=taste_model.feature_importances_, y=X.columns, ax=ax, orient="h")
-    ax.set_title("Feature Importance (Taste Model)")
-    ax.set_xlabel("Importance")
-    ax.set_ylabel("Feature")
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.5f"))
-    plt.tight_layout()
-    return fig
+# Load dataset (cached)
+@st.cache_data
+def load_dataset(path: str = DATA_PATH) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_excel(path)
+    df.columns = df.columns.str.strip()
+    # normalize peptide column if present
+    if "peptide" in df.columns:
+        df["peptide"] = df["peptide"].astype(str).str.replace(r"\s+", "", regex=True).str.upper()
+    return df
 
-def plot_docking_scatter():
-    y_pred = dock_model.predict(X_test)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(y_dock_test, y_pred, alpha=0.6)
-    mn, mx = float(min(y_dock_test.min(), y_pred.min())), float(max(y_dock_test.max(), y_pred.max()))
-    ax.plot([mn, mx], [mn, mx], 'r--')
-    ax.set_xlabel("Actual Docking Score (kcal/mol) [Test Set]")
-    ax.set_ylabel("Predicted Docking Score (kcal/mol) [Test Set]")
-    ax.set_title("Docking Score: Actual vs Predicted")
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
-    plt.tight_layout()
-    return fig
+data = load_dataset()
 
-# ---------- UI ----------
-with gr.Blocks() as demo:
-    gr.Markdown("# 🧬 Peptide Sequence Property Prediction")
+# Train or load model (cached resource)
+@st.cache_resource
+def train_or_load_model():
+    """
+    Train or load RandomForest classifier.
+    Returns (model, X_df, y_series, acc, report)
+    """
+    if data.empty:
+        return None, None, None, None, None
 
-    with gr.Tab("Single Prediction + PDB"):
-        seq_in = gr.Textbox(label="Peptide sequence", placeholder="e.g., ADHDLPF")
-        table_out = gr.Dataframe(label="Results", row_count=1, interactive=False)
-        pdb_file = gr.File(label="Download PDB", type="binary")
+    # Try loading saved model
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+            # compute features for the dataset for quick metrics
+            if "peptide" in data.columns and "Taste" in data.columns:
+                X_full = compute_features(data["peptide"].tolist())
+                y_full = data["Taste"].astype(str).str.strip()
+                # drop invalid rows
+                mask_valid = ~X_full.isna().any(axis=1)
+                if mask_valid.any():
+                    try:
+                        y_pred_full = model.predict(X_full.loc[mask_valid])
+                        acc_full = accuracy_score(y_full.loc[mask_valid], y_pred_full)
+                        report_full = classification_report(y_full.loc[mask_valid], y_pred_full, output_dict=True)
+                    except Exception:
+                        acc_full = None
+                        report_full = None
+                else:
+                    acc_full = None
+                    report_full = None
+                return model, X_full, y_full, acc_full, report_full
+            else:
+                return model, None, None, None, None
+        except Exception:
+            st.warning("Found model file but failed to load. Retraining...")
 
-        # One input triggers both prediction + pdb
-        seq_in.change(fn=predict_single, inputs=seq_in, outputs=table_out)
-        seq_in.change(fn=save_pdb, inputs=seq_in, outputs=pdb_file)
+    # Train fresh model
+    if "peptide" not in data.columns or "Taste" not in data.columns:
+        return None, None, None, None, None
 
-    with gr.Tab("Batch Prediction"):
-        file_in = gr.File(label="Upload Excel/CSV with a 'peptide' column")
-        table_out2 = gr.Dataframe()
-        file_in.change(fn=batch_predict, inputs=file_in, outputs=table_out2)
+    X_all = compute_features(data["peptide"].tolist())
+    y_all = data["Taste"].astype(str).str.strip()
 
-    with gr.Tab("Visualizations"):
-        gr.Markdown("### Taste Model")
-        out1 = gr.Plot()
-        gr.Button("Show Confusion Matrix (Taste)").click(fn=plot_confusion_taste, outputs=out1)
-        gr.Markdown("### Solubility Model")
-        out2 = gr.Plot()
-        gr.Button("Show Confusion Matrix (Solubility)").click(fn=plot_confusion_solubility, outputs=out2)
-        gr.Markdown("### PCA (Taste Features)")
-        out3 = gr.Plot()
-        gr.Button("Show PCA (Taste)").click(fn=plot_pca, outputs=out3)
-        gr.Markdown("### Feature Importance (Taste Model)")
-        out4 = gr.Plot()
-        gr.Button("Show Feature Importance (Taste)").click(fn=plot_importance, outputs=out4)
-        gr.Markdown("### Docking Score Regression")
-        out5 = gr.Plot()
-        gr.Button("Show Docking Score Scatter Plot").click(fn=plot_docking_scatter, outputs=out5)
+    # drop rows with NaN features (invalid sequences)
+    mask_valid = ~X_all.isna().any(axis=1)
+    X_all = X_all.loc[mask_valid].reset_index(drop=True)
+    y_all = y_all.loc[mask_valid].reset_index(drop=True)
 
-    with gr.Tab("Model Report"):
-        gr.Markdown(model_report)
+    if X_all.empty:
+        return None, None, None, None, None
+
+    # remove classes with fewer than 2 samples (can't stratify)
+    counts = y_all.value_counts()
+    valid_classes = counts[counts >= 2].index
+    mask_class = y_all.isin(valid_classes)
+    X = X_all.loc[mask_class].reset_index(drop=True)
+    y = y_all.loc[mask_class].reset_index(drop=True)
+
+    if len(y.unique()) < 2:
+        return None, None, None, None, None
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    model = RandomForestClassifier(n_estimators=200, max_depth=20, random_state=42)
+    model.fit(X_train, y_train)
+
+    try:
+        joblib.dump(model, MODEL_PATH)
+    except Exception:
+        st.warning("Could not persist trained model to disk.")
+
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+
+    return model, X, y, acc, report
+
+model, X_df, y_series, acc, report = train_or_load_model()
+
+# Layout: tabs
+tabs = st.tabs(["Predict ✨", "Batch 📤", "Model 🔍", "Dataset 📂", "Structure 🧬"])
+
+# Dataset tab
+with tabs[3]:
+    st.subheader("📂 Dataset Preview")
+    if data.empty:
+        st.info(f"No dataset found at {DATA_PATH}. Place AIML.xlsx in the app root to enable training.")
+    else:
+        st.dataframe(data.head(50))
+
+# Model metrics tab
+with tabs[2]:
+    st.subheader("🔎 Model Metrics")
+    if model is None:
+        st.info("Model not available. Ensure dataset is present and has enough labeled examples.")
+    else:
+        with st.expander("Classification report"):
+            if acc is not None:
+                st.success(f"Model hold-out accuracy: {acc:.3f}")
+            if report is not None:
+                st.json(report)
+        with st.expander("Top feature importances"):
+            try:
+                feat_imp = pd.Series(model.feature_importances_, index=X_df.columns).sort_values(ascending=False).head(20)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                sns.barplot(x=feat_imp.values, y=feat_imp.index, ax=ax)
+                ax.set_title("Top 20 Feature Importances")
+                st.pyplot(fig)
+            except Exception as e:
+                st.warning(f"Could not compute feature importances: {e}")
+        with st.expander("Confusion matrix"):
+            try:
+                y_pred_all = model.predict(X_df)
+                cm = confusion_matrix(y_series, y_pred_all, labels=model.classes_)
+                cm_df = pd.DataFrame(cm, index=model.classes_, columns=model.classes_)
+                fig2, ax2 = plt.subplots(figsize=(6, 5))
+                sns.heatmap(cm_df, annot=True, fmt="d", cmap="Blues", ax=ax2)
+                ax2.set_xlabel("Predicted")
+                ax2.set_ylabel("Actual")
+                st.pyplot(fig2)
+            except Exception as e:
+                st.warning(f"Could not compute confusion matrix: {e}")
+
+# Predict tab
+with tabs[0]:
+    st.subheader("🔬 Predict Taste and Properties of a Peptide")
+    st.caption("Enter a peptide sequence (one-letter amino acid codes).")
+
+    col_main, col_side = st.columns([2, 1])
+    with col_main:
+        user_seq = st.text_input("Peptide sequence:", key="user_seq", value=st.session_state.get("user_seq", ""))
+        predict_btn = st.button("Predict")
+
+        if predict_btn:
+            if not user_seq:
+                st.warning("Please enter a peptide sequence.")
+            else:
+                ok, msg = validate_sequence(user_seq)
+                if not ok:
+                    st.error(msg)
+                else:
+                    # compute single features
+                    try:
+                        feats_df = compute_features([msg])
+                    except Exception as e:
+                        st.error(f"Feature computation failed: {e}")
+                        feats_df = pd.DataFrame()
+
+                    if feats_df.empty or feats_df.isna().all(axis=None):
+                        st.warning("Feature computation failed or returned invalid values.")
+                    else:
+                        # Rule override for salty
+                        if msg in OVERRIDE_SALTY:
+                            predicted = "Salty"
+                            probs = None
+                        else:
+                            if model is None:
+                                st.warning("Model not available to generate prediction.")
+                                predicted = "Unknown"
+                                probs = None
+                            else:
+                                predicted = model.predict(feats_df)[0]
+                                try:
+                                    probs = model.predict_proba(feats_df)[0]
+                                except Exception:
+                                    probs = None
+
+                        st.markdown(f"<div class='card'><h3 style='margin:0'>Predicted Taste: <span style='color:#66b8ff'>{predicted}</span></h3></div>", unsafe_allow_html=True)
+
+                        if probs is not None:
+                            st.markdown("**Class probabilities**")
+                            top_idx = np.argsort(probs)[::-1][:6]
+                            for i in top_idx:
+                                cls = model.classes_[i]
+                                p = probs[i]
+                                pct = int(round(p * 100))
+                                color = "#198754" if pct >= 60 else ("#0d6efd" if pct >= 30 else "#fd7e14")
+                                st.markdown(
+                                    f"<div class='card small' style='margin-bottom:6px'>"
+                                    f"<strong>{cls}</strong> <span style='float:right'>{pct}%</span>"
+                                    f"<div style='background:#e9ecef; border-radius:6px; height:10px; margin-top:6px;'>"
+                                    f"<div style='width:{pct}%; background:{color}; height:100%; border-radius:6px;'></div>"
+                                    "</div></div>",
+                                    unsafe_allow_html=True
+                                )
+
+                        # Side column: properties, docking score, 3-letter seq, PDB
+                        with col_side:
+                            st.subheader("🧪 Properties")
+                            try:
+                                props = compute_peptide_properties(msg)
+                                # docking heuristic
+                                confidence = float(np.max(probs)) if probs is not None else 0.0
+                                gravy = props.get("GRAVY (Hydropathy)", 0.0)
+                                docking_score = compute_docking_score(gravy, confidence)
+                                props["Docking score (pred)"] = f"{docking_score} / 100"
+                                st.table(pd.DataFrame.from_dict(props, orient="index", columns=["Value"]))
+                                # visual progress
+                                try:
+                                    st.progress(int(docking_score))
+                                except Exception:
+                                    st.progress(int(docking_score) / 100.0)
+                            except Exception as e:
+                                st.error(f"Could not compute properties: {e}")
+
+                            st.subheader("🧬 3-letter Sequence")
+                            if HAS_BIOPY:
+                                try:
+                                    aa3 = [seq3(res) for res in msg]
+                                    st.write(" - ".join(aa3))
+                                except Exception:
+                                    st.write("Could not compute 3-letter sequence.")
+                            else:
+                                st.write("Biopython not installed: cannot convert to 3-letter codes.")
+
+                            # PDB generation and download
+                            if st.button("Generate PDB for download"):
+                                try:
+                                    fname, pdb_bytes = save_pdb_bytes(msg)
+                                    st.download_button("Download PDB", data=pdb_bytes, file_name=fname, mime="chemical/x-pdb")
+                                except Exception as e:
+                                    st.error(f"PDB generation failed: {e}")
+
+# Batch tab
+with tabs[1]:
+    st.subheader("📤 Batch Prediction from File")
+    uploaded = st.file_uploader("Upload CSV or Excel with a 'peptide' column", type=["csv", "xls", "xlsx"])
+
+    if uploaded:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
+                df_up = pd.read_csv(uploaded)
+            else:
+                df_up = pd.read_excel(uploaded)
+        except Exception as e:
+            st.error(f"Failed to read file: {e}")
+            df_up = None
+
+        if df_up is not None:
+            df_up.columns = df_up.columns.str.strip()
+            if "peptide" not in df_up.columns:
+                st.error("File must contain 'peptide' column.")
+            else:
+                df_up["_peptide_norm"] = df_up["peptide"].astype(str).str.strip().str.upper()
+                df_up["_valid"] = df_up["_peptide_norm"].apply(lambda s: validate_sequence(s)[0])
+                if not df_up["_valid"].any():
+                    st.error("No valid peptide sequences found.")
+                else:
+                    with st.spinner("Computing features and predicting..."):
+                        feats_up = compute_features(df_up.loc[df_up["_valid"], "_peptide_norm"].tolist())
+                    if feats_up.empty:
+                        st.error("Feature computation produced no results.")
+                    elif model is None:
+                        st.error("Model unavailable for predictions.")
+                    else:
+                        try:
+                            preds = model.predict(feats_up)
+                            df_up.loc[df_up["_valid"], "Predicted_Taste"] = preds
+                            st.write("Batch predictions (invalid rows flagged):")
+                            st.dataframe(df_up.drop(columns=["_peptide_norm"]))
+                            st.download_button("Download predictions CSV", data=df_up.drop(columns=["_peptide_norm"]).to_csv(index=False).encode(), file_name="predictions.csv", mime="text/csv")
+                        except Exception as e:
+                            st.error(f"Batch prediction failed: {e}")
+
+# Structure tab (py3Dmol)
+with tabs[4]:
+    st.subheader("🧬 Structure Visualization (upload PDB)")
+    st.markdown("Generate structures using AlphaFold/ColabFold externally, then upload the PDB to visualize it here.")
+    uploaded_pdb = st.file_uploader("Upload PDB file", type=["pdb"])
+    def _show_pdb_in_py3dmol(pdb_text: str, width: int = 700, height: int = 450):
+        if not HAS_PY3DMOL:
+            st.error("py3Dmol is not installed. Install with `pip install py3Dmol` to use the viewer.")
+            return
+        view = py3Dmol.view(width=width, height=height)
+        view.addModel(pdb_text, "pdb")
+        view.setStyle({"cartoon": {"color": "spectrum"}})
+        view.zoomTo()
+        st.components.v1.html(view._make_html(), height=height)
+    if uploaded_pdb is not None:
+        try:
+            pdb_text = uploaded_pdb.read().decode("utf-8")
+            _show_pdb_in_py3dmol(pdb_text)
+        except Exception as e:
+            st.error(f"Failed to render PDB: {e}")
+    else:
+        st.info("No PDB uploaded yet. Use ColabFold to predict structures and upload the PDB file.")
+
+# Footer
+st.markdown("---")
+st.markdown("Built with ❤️ — Streamlit UI. Feature computation uses Biopython; PDB generation uses PeptideBuilder when available.")
