@@ -241,10 +241,19 @@ with st.sidebar:
     if st.button("Use sample"):
         st.session_state["user_seq"] = sample
     st.divider()
-    st.markdown("Notes")
-    st.markdown("- Ensure AIML.xlsx (dataset) is in the app root to enable training.")
-    st.markdown("- Upload PDBs from AlphaFold/ColabFold to visualize structures.")
-    st.markdown("- PeptideBuilder is optional; if missing a CA-only PDB will be generated.")
+    st.markdown("**About This Tool**")
+    st.markdown(
+        "PepTastePredictor is a **machine learning-based predictive model** trained on peptide "
+        "taste classification data. It uses a Random Forest classifier to predict peptide taste classes "
+        "based on computed biochemical properties."
+    )
+    st.markdown("**Key Features:**")
+    st.markdown(
+        "- **Machine Learning Model**: Trained on labeled peptide sequences using scikit-learn\n"
+        "- **Property Computation**: Uses Biopython (Bio.SeqUtils.ProtParam) to compute 11 key biochemical features\n"
+        "- **Structure Generation**: Generates 3D PDB files using PeptideBuilder for visualization\n"
+        "- **Confidence Scores**: Provides probability distributions for predicted taste classes"
+    )
 
 # Load dataset (cached)
 @st.cache_data
@@ -412,21 +421,16 @@ with tabs[0]:
                     if feats_df.empty or feats_df.isna().all(axis=None):
                         st.warning("Feature computation failed or returned invalid values.")
                     else:
-                        # Rule override for salty
-                        if msg in OVERRIDE_SALTY:
-                            predicted = "Salty"
+                        if model is None:
+                            st.warning("Model not available to generate prediction.")
+                            predicted = "Unknown"
                             probs = None
                         else:
-                            if model is None:
-                                st.warning("Model not available to generate prediction.")
-                                predicted = "Unknown"
+                            predicted = model.predict(feats_df)[0]
+                            try:
+                                probs = model.predict_proba(feats_df)[0]
+                            except Exception:
                                 probs = None
-                            else:
-                                predicted = model.predict(feats_df)[0]
-                                try:
-                                    probs = model.predict_proba(feats_df)[0]
-                                except Exception:
-                                    probs = None
 
                         st.markdown(f"<div class='card'><h3 style='margin:0'>Predicted Taste: <span style='color:#66b8ff'>{predicted}</span></h3></div>", unsafe_allow_html=True)
 
