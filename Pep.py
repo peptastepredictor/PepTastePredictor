@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""
-PeptideTaste.py
-
-Single-file Streamlit app that merges two provided codebases into one cohesive
-Streamlit application. The Streamlit UI is authoritative; helper functions and
-model logic are taken from both sources and the most robust (high-certainty)
-implementation is used when overlapping.
-
-Features:
-- Load dataset (AIML.xlsx) and train / load a RandomForest taste classifier.
-- Single-sequence prediction with feature computation, probabilities, docking
-  heuristic, 3-letter conversion, and PDB generation (PeptideBuilder if available,
-  fallback CA trace).
-- Batch prediction from CSV / Excel with a 'peptide' column.
-- Model metrics: classification report, confusion matrix, top feature importances.
-- 3D PDB visualization using py3Dmol (if installed) for uploaded PDBs.
-- Defensive validation, stable feature ordering, and caching for speed.
-
-Run:
-  streamlit run PeptideTaste.py
-
-Requirements (install as needed):
-  pip install streamlit pandas numpy scikit-learn joblib biopython matplotlib seaborn py3Dmol
-  (PeptideBuilder optional: pip install PeptideBuilder)
-"""
 
 import os
 import io
@@ -79,8 +53,6 @@ THREE_LETTER = {
     "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG", "S": "SER",
     "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"
 }
-# Rule-based overrides (always salty, uppercase)
-OVERRIDE_SALTY = {"NQITKPNDVY", "EDEGEQPRPF"}
 
 # -----------------------------
 # Utility functions (feature computation, validation, docking)
@@ -269,10 +241,19 @@ with st.sidebar:
     if st.button("Use sample"):
         st.session_state["user_seq"] = sample
     st.divider()
-    st.markdown("Notes")
-    st.markdown("- Ensure AIML.xlsx (dataset) is in the app root to enable training.")
-    st.markdown("- Upload PDBs from AlphaFold/ColabFold to visualize structures.")
-    st.markdown("- PeptideBuilder is optional; if missing a CA-only PDB will be generated.")
+    st.markdown("**About This Tool**")
+    st.markdown(
+        "PepTastePredictor is a **machine learning-based predictive model** trained on peptide "
+        "taste classification data. It uses a Random Forest classifier to predict peptide taste classes "
+        "based on computed biochemical properties."
+    )
+    st.markdown("**Key Features:**")
+    st.markdown(
+        "- **Machine Learning Model**: Trained on labeled peptide sequences using scikit-learn\n"
+        "- **Property Computation**: Uses Biopython (Bio.SeqUtils.ProtParam) to compute 11 key biochemical features\n"
+        "- **Structure Generation**: Generates 3D PDB files using PeptideBuilder for visualization\n"
+        "- **Confidence Scores**: Provides probability distributions for predicted taste classes"
+    )
 
 # Load dataset (cached)
 @st.cache_data
@@ -440,21 +421,16 @@ with tabs[0]:
                     if feats_df.empty or feats_df.isna().all(axis=None):
                         st.warning("Feature computation failed or returned invalid values.")
                     else:
-                        # Rule override for salty
-                        if msg in OVERRIDE_SALTY:
-                            predicted = "Salty"
+                        if model is None:
+                            st.warning("Model not available to generate prediction.")
+                            predicted = "Unknown"
                             probs = None
                         else:
-                            if model is None:
-                                st.warning("Model not available to generate prediction.")
-                                predicted = "Unknown"
+                            predicted = model.predict(feats_df)[0]
+                            try:
+                                probs = model.predict_proba(feats_df)[0]
+                            except Exception:
                                 probs = None
-                            else:
-                                predicted = model.predict(feats_df)[0]
-                                try:
-                                    probs = model.predict_proba(feats_df)[0]
-                                except Exception:
-                                    probs = None
 
                         st.markdown(f"<div class='card'><h3 style='margin:0'>Predicted Taste: <span style='color:#66b8ff'>{predicted}</span></h3></div>", unsafe_allow_html=True)
 
@@ -485,7 +461,9 @@ with tabs[0]:
                                 gravy = props.get("GRAVY (Hydropathy)", 0.0)
                                 docking_score = compute_docking_score(gravy, confidence)
                                 props["Docking score (pred)"] = f"{docking_score} / 100"
-                                st.table(pd.DataFrame.from_dict(props, orient="index", columns=["Value"]))
+                                # Convert all values to strings to avoid Arrow serialization issues
+                                props_str = {k: str(v) for k, v in props.items()}
+                                st.table(pd.DataFrame.from_dict(props_str, orient="index", columns=["Value"]))
                                 # visual progress
                                 try:
                                     st.progress(int(docking_score))
@@ -504,13 +482,27 @@ with tabs[0]:
                             else:
                                 st.write("Biopython not installed: cannot convert to 3-letter codes.")
 
-                            # PDB generation and download
-                            if st.button("Generate PDB for download"):
-                                try:
-                                    fname, pdb_bytes = save_pdb_bytes(msg)
-                                    st.download_button("Download PDB", data=pdb_bytes, file_name=fname, mime="chemical/x-pdb")
-                                except Exception as e:
-                                    st.error(f"PDB generation failed: {e}")
+                            st.divider()
+                            st.subheader("🧬 PDB Structure")
+                            st.warning(
+                                "⚠️ **Note**: This is a simple predicted structure based on peptide builder. "
+                                "For practical usage such as molecular docking and other computational studies, "
+                                "use **ColabFold** (available in the Structure tab) to generate high-confidence "
+                                "AI-predicted 3D structures."
+                            )
+                            # Auto-generate PDB file
+                            try:
+                                fname, pdb_bytes = save_pdb_bytes(msg)
+                                st.success(f"✅ Generated: {fname}")
+                                st.download_button(
+                                    label="📥 Download PDB",
+                                    data=pdb_bytes,
+                                    file_name=fname,
+                                    mime="chemical/x-pdb",
+                                    key=f"pdb_download_{msg}"
+                                )
+                            except Exception as e:
+                                st.error(f"PDB generation failed: {e}")
 
 # Batch tab
 with tabs[1]:
@@ -556,7 +548,17 @@ with tabs[1]:
 # Structure tab (py3Dmol)
 with tabs[4]:
     st.subheader("🧬 Structure Visualization (upload PDB)")
-    st.markdown("Generate structures using AlphaFold/ColabFold externally, then upload the PDB to visualize it here.")
+    st.markdown(
+        "You can generate a predicted 3D structure for your peptide using "
+        "**[ColabFold]("
+        "https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/AlphaFold2_mmseqs2_advanced.ipynb"
+        ")**:\n"
+        "1. Open the link above in Google Colab.\n"
+        "2. Paste your peptide sequence in FASTA format.\n"
+        "3. Run the notebook (needs a GPU runtime).\n"
+        "4. Download the predicted PDB file.\n"
+        "5. Upload the PDB file below to visualize it here."
+    )
     uploaded_pdb = st.file_uploader("Upload PDB file", type=["pdb"])
     def _show_pdb_in_py3dmol(pdb_text: str, width: int = 700, height: int = 450):
         if not HAS_PY3DMOL:
@@ -578,4 +580,4 @@ with tabs[4]:
 
 # Footer
 st.markdown("---")
-st.markdown("Built with ❤️ — Streamlit UI. Feature computation uses Biopython; PDB generation uses PeptideBuilder when available.")
+st.markdown(" Feature computation uses Biopython; PDB generation uses PeptideBuilder.")
